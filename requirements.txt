@@ -1,0 +1,6 @@
+Flask
+google-cloud-storage
+google-cloud-bigquery
+google-auth
+python-dotenv
+requests
