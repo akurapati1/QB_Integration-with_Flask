@@ -1,22 +1,19 @@
 # services/gcs_writer.py
 import json
 import gzip
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Iterable, Dict, Any, Optional
 
 from google.cloud import storage
 from google.oauth2 import service_account
 
-
 class GCSWriter:
     """
-    Streams JSONL data into Google Cloud Storage using constant memory.
+    JSONL writer to Google Cloud Storage.
 
-    Example:
-        gcs = GCSWriter(project_id, cred_path, bucket="my-bucket",
-                        prefix="quickbase_exports/", compress=True)
-        object_name = gcs.new_object_name()  # e.g., quickbase_exports/qb_records_20250908T120000Z.jsonl.gz
-        count = gcs.stream_jsonl(object_name, records_iterable)
+    - open_jsonl(object_name): open ONE object once (with ignore_flush=True).
+    - write_batch(writer, records): write a page of dicts to that object.
     """
 
     def __init__(
@@ -28,15 +25,6 @@ class GCSWriter:
         compress: bool = True,
         chunk_size_mb: int = 5,
     ) -> None:
-        """
-        Args:
-            project_id: GCP project id
-            cred_path: path to a service account JSON key
-            bucket: GCS bucket name
-            prefix: folder/prefix for objects (e.g., "quickbase_exports/")
-            compress: if True, writes .jsonl.gz with Content-Encoding=gzip
-            chunk_size_mb: resumable upload chunk size (MB)
-        """
         creds = service_account.Credentials.from_service_account_file(cred_path)
         self.client = storage.Client(credentials=creds, project=project_id)
         self.bucket_name = bucket
@@ -45,53 +33,58 @@ class GCSWriter:
         self.compress = bool(compress)
         self.chunk_size = max(1, int(chunk_size_mb)) * 1024 * 1024  # bytes
 
-    # ------------ Public API ------------
-
     def new_object_name(self, basename: str = "qb_records", ts: Optional[datetime] = None) -> str:
-        """
-        Create a timestamped object name under the configured prefix.
-
-        Returns:
-            e.g., "quickbase_exports/qb_records_20250908T120000Z.jsonl.gz"
-        """
         ts = ts or datetime.utcnow()
         stamp = ts.strftime("%Y%m%dT%H%M%SZ")
         ext = "jsonl.gz" if self.compress else "jsonl"
         return f"{self.prefix}/{basename}_{stamp}.{ext}"
 
-    def stream_jsonl(self, object_name: str, records: Iterable[Dict[str, Any]]) -> int:
+    @contextmanager
+    def open_jsonl(self, object_name: str):
         """
-        Stream an iterable of dicts to a JSONL (optionally gzipped) object in GCS.
-
-        Args:
-            object_name: path within the bucket (no gs://)
-            records: iterable of Python dicts; each becomes one JSON line
-
-        Returns:
-            Number of records written.
+        Open a JSONL (optionally gzipped) object for writing once.
+        Uses ignore_flush=True to avoid flush errors during resumable upload.
         """
         blob = self.bucket.blob(object_name)
         blob.chunk_size = self.chunk_size
-        # NDJSON mime; BigQuery accepts this for newline-delimited JSON
         blob.content_type = "application/x-ndjson"
         if self.compress:
             blob.content_encoding = "gzip"
 
-        count = 0
-        with blob.open("wb") as raw:
-            writer = gzip.GzipFile(fileobj=raw, mode="wb", compresslevel=6, mtime=0) if self.compress else raw
+        # IMPORTANT: ignore_flush=True prevents the “Cannot flush...” error.
+        raw = blob.open("wb", ignore_flush=True)
+        writer = gzip.GzipFile(fileobj=raw, mode="wb", compresslevel=6, mtime=0) if self.compress else raw
+
+        try:
+            yield writer
+        finally:
+            # Close cleanly; ensure gzip footer and upload finalization.
             try:
-                for rec in records:
-                    # compact separators; ensure_ascii False preserves UTF-8
-                    line = (json.dumps(rec, ensure_ascii=False, default=str) + "\n").encode("utf-8")
-                    writer.write(line)
-                    count += 1
-            finally:
-                # If gzip, make sure footer is flushed
-                if writer is not raw:
-                    writer.close()
+                writer.close()
+            except Exception:
+                pass
+            try:
+                if raw is not writer:  # when gzip wrapped
+                    raw.close()
+            except Exception:
+                pass
+
+    def write_batch(self, writer, records: Iterable[Dict[str, Any]]) -> int:
+        """
+        Write a batch of dicts as JSONL lines. No per-batch flush (not supported).
+        """
+        count = 0
+        for rec in records:
+            line = (json.dumps(rec, ensure_ascii=False, default=str) + "\n").encode("utf-8")
+            writer.write(line)
+            count += 1
+        # Do NOT writer.flush(): BlobWriter does not support flush during resumable uploads.
         return count
 
+    # Optional compatibility helper
+    def stream_jsonl(self, object_name: str, records: Iterable[Dict[str, Any]]) -> int:
+        with self.open_jsonl(object_name) as w:
+            return self.write_batch(w, records)
+
     def exists(self, object_name: str) -> bool:
-        """Return True if the object exists in the bucket."""
         return self.bucket.blob(object_name).exists()
