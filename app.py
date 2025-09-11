@@ -10,18 +10,18 @@ def create_app():
     app = Flask(__name__)
     cfg = AppConfig()
 
-    # logging.basicConfig(
-    #     level=getattr(logging, cfg.LOG_LEVEL.upper(), logging.INFO),
-    #     format="%(asctime)s %(levelname)s %(name)s - %(message)s"
-    # )
-    # log = logging.getLogger("qb_flask")
+    logging.basicConfig(
+        level=getattr(logging, cfg.LOG_LEVEL.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s - %(message)s"
+    )
+    log = logging.getLogger("qb_flask")
 
-    # qb = QuickbaseClient(cfg.QB_REALMID, cfg.QB_USER_TOKEN, cfg.QB_TABLEID)
-    # gcs = GCSWriter(cfg.PROJECT_ID, cfg.GCP_CREDENTIALS_PATH, cfg.BUCKET, cfg.GCS_PREFIX, cfg.COMPRESS_JSONL)
+    qb = QuickbaseClient(cfg.QB_REALMID, cfg.QB_USER_TOKEN, cfg.QB_TABLEID)
+    gcs = GCSWriter(cfg.PROJECT_ID, cfg.GCP_CREDENTIALS_PATH, cfg.BUCKET, cfg.GCS_PREFIX, cfg.COMPRESS_JSONL)
 
-    # @app.get("/health")
-    # def health():
-    #     return jsonify({"ok": True})
+    @app.get("/health")
+    def health():
+        return jsonify({"ok": True})
 
     @app.route("/run", methods=["GET", "POST"])
     def run():
