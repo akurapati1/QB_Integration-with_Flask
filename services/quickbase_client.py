@@ -37,7 +37,7 @@ class QuickbaseClient:
         page_size: int,
         skip: int,
         *,
-        flatten_values: bool = True,
+        flatten_values: bool = False,
         select_all_fields: bool = True,
         select: Optional[list] = None,
         timeout: int = 120,
@@ -55,8 +55,11 @@ class QuickbaseClient:
         resp.raise_for_status()
         js = resp.json()
         raw_rows = js.get("data", []) or []
+
+        
         if not flatten_values:
             return raw_rows
+        
         return [self._flatten_one(row) for row in raw_rows]
 
     @staticmethod

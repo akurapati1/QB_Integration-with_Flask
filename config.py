@@ -8,7 +8,7 @@ load_dotenv()
 class AppConfig:
     # Flask
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
-
+    FLASK_ENV: str = os.getenv("FLASK_ENV", "Development")
     # Quickbase
     QB_REALMID: str = os.environ["QB_REALMID"]
     QB_TABLEID: str = os.environ["QB_TABLEID"]
