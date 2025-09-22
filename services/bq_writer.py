@@ -9,7 +9,8 @@ from google.cloud import bigquery
 from google.cloud import storage
 from google.oauth2 import service_account
 from io import StringIO
-
+import uuid
+from datetime import datetime, timezone, timedelta
 from schemas.field_mappings import QuickBaseSchema
 
 class BQWriter:
@@ -37,26 +38,176 @@ class BQWriter:
             dataset = self.bq_client.create_dataset(dataset)
             self.logger.info(f'Created dataset {dataset_id}')
     
-    def create_table_with_schema(self, dataset_id: str, table_id: str, schema_fields: List) -> str:
-        """Create BigQuery table with specified schema"""
-        self.create_dataset_if_not_exists(dataset_id)
-        
+    def _create_temp_table(self, dataset_id: str, table_id: str, schema_fields: List) -> str:
+        """Create a temp table that auto-expires (cleanup safety net)."""
         table_ref = self.bq_client.dataset(dataset_id).table(table_id)
-        
-        try:
-            # Drop and recreate table to ensure schema matches
-            self.bq_client.delete_table(table_ref, not_found_ok=True)
-            self.logger.info(f'Dropped existing table {dataset_id}.{table_id}')
-        except Exception as e:
-            self.logger.info(f'No existing table to drop: {e}')
-        
-        # Create fresh table
         table = bigquery.Table(table_ref, schema=schema_fields)
+        table.expires = datetime.now(timezone.utc) + timedelta(hours=24)  # auto-cleanup
         table = self.bq_client.create_table(table)
-        self.logger.info(f'Created fresh table {dataset_id}.{table_id}')
-        
+        return f"{self.project_id}.{dataset_id}.{table_id}"
+
+    def load_gcs_file_to_staging_upsert(
+        self,
+        gcs_uri: str,
+        dataset_id: str,
+        table_id: str,
+        *,
+        key_column: str = "record_id",
+        modified_ts_column: str = "modified_date",
+    ) -> Dict[str, Any]:
+        """
+        Upsert rows from the GCS file into the staging table by record_id.
+        Steps:
+        - Ensure staging exists (no drop).
+        - Load transformed JSONL into a fresh temp table.
+        - MERGE temp -> staging (update if newer, insert if missing).
+        - Delete temp in finally; temp also auto-expires.
+        """
+        temp_fqid = None
+        try:
+            # Ensure staging exists (do NOT drop)
+            schema_fields = QuickBaseSchema.get_bigquery_schema()
+            staging_fqid = self.create_table_with_schema(
+                dataset_id, table_id, schema_fields, drop_existing=False
+            )
+
+            # Create fresh temp
+            temp_table = f"{table_id}__load_{uuid.uuid4().hex[:8]}"
+            temp_fqid  = self._create_temp_table(dataset_id, temp_table, schema_fields)
+
+            # Transform from GCS
+            records = self._read_and_transform_gcs_file(gcs_uri)
+            if not records:
+                return {
+                    "success": True,
+                    "message": "No records to upsert",
+                    "rows_loaded": 0,
+                    "rows_affected": 0,
+                    "table_id": staging_fqid,
+                }
+
+            # Load into temp
+            table_ref = self.bq_client.get_table(temp_fqid)
+            job_config = bigquery.LoadJobConfig(
+                write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+                source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+                max_bad_records=10,
+            )
+            jsonl_data = "\n".join(json.dumps(r) for r in records)
+            load_job = self.bq_client.load_table_from_file(
+                StringIO(jsonl_data),
+                destination=table_ref,
+                job_config=job_config,
+            )
+            load_job.result()
+            if load_job.errors:
+                return {
+                    "success": False,
+                    "message": f"Load to temp failed: {load_job.errors}",
+                    "rows_loaded": 0,
+                }
+
+            # Dynamic MERGE (dedupe latest per key in temp)
+            cols = [m.bq_column_name for m in QuickBaseSchema.FIELD_MAPPINGS]
+            update_cols = [c for c in cols if c != key_column]
+            set_clause   = ", ".join([f"target.{c} = source.{c}" for c in update_cols])
+            insert_cols  = ", ".join([f"`{c}`" for c in cols])
+            insert_vals  = ", ".join([f"source.{c}" for c in cols])
+
+            project = self.project_id
+            src = f"`{project}.{dataset_id}.{temp_table}`"
+            tgt = f"`{project}.{dataset_id}.{table_id}`"
+
+            merge_sql = f"""
+            MERGE {tgt} AS target
+            USING (
+            SELECT * EXCEPT(rn) FROM (
+                SELECT s.*, ROW_NUMBER() OVER (
+                PARTITION BY {key_column}
+                ORDER BY {modified_ts_column} DESC
+                ) AS rn
+                FROM {src} AS s
+            )
+            WHERE rn = 1
+            ) AS source
+            ON target.{key_column} = source.{key_column}
+            WHEN MATCHED AND source.{modified_ts_column} > target.{modified_ts_column} THEN
+            UPDATE SET {set_clause}
+            WHEN NOT MATCHED THEN
+            INSERT ({insert_cols}) VALUES ({insert_vals})
+            """
+
+            merge_job = self.bq_client.query(merge_sql)
+            merge_job.result()
+            if merge_job.errors:
+                return {
+                    "success": False,
+                    "message": f"MERGE failed: {merge_job.errors}",
+                    "rows_loaded": len(records),
+                    "table_id": staging_fqid,
+                }
+
+            affected = getattr(merge_job, "num_dml_affected_rows", None)
+            return {
+                "success": True,
+                "message": f"Upserted into {staging_fqid}",
+                "rows_loaded": len(records),   # loaded into temp
+                "rows_affected": affected,     # changed in staging
+                "table_id": staging_fqid,
+            }
+
+        except Exception as e:
+            self.logger.error(f"Upsert to staging failed: {str(e)}")
+            return {"success": False, "message": str(e), "rows_loaded": 0}
+        finally:
+            # Best-effort temp cleanup
+            if temp_fqid:
+                try:
+                    self.bq_client.delete_table(temp_fqid, not_found_ok=True)
+                except Exception:
+                    self.logger.warning(
+                        f"Could not delete temp table {temp_fqid} (it will auto-expire)."
+                    )
+
+    def create_table_with_schema(
+        self,
+        dataset_id: str,
+        table_id: str,
+        schema_fields: List,
+        drop_existing: bool = False
+    ) -> str:
+        """Create (or recreate) BigQuery table with specified schema."""
+        self.create_dataset_if_not_exists(dataset_id)
+        table_ref = self.bq_client.dataset(dataset_id).table(table_id)
+
+        def _new_table():
+            table = bigquery.Table(table_ref, schema=schema_fields)
+            # Partition by modified_date (DAY); cluster by record_id
+            table.time_partitioning = bigquery.TimePartitioning(
+                type_=bigquery.TimePartitioningType.DAY,
+                field="modified_date"
+            )
+            table.clustering_fields = ["record_id"]
+            return self.bq_client.create_table(table)
+
+        if drop_existing:
+            try:
+                self.bq_client.delete_table(table_ref, not_found_ok=True)
+                self.logger.info(f'Dropped existing table {dataset_id}.{table_id}')
+            except Exception as e:
+                self.logger.info(f'No existing table to drop: {e}')
+            _new_table()
+            self.logger.info(f'Created fresh table {dataset_id}.{table_id} (partitioned by modified_date, clustered by record_id)')
+        else:
+            try:
+                self.bq_client.get_table(table_ref)
+                self.logger.info(f'Table {dataset_id}.{table_id} already exists')
+            except Exception:
+                _new_table()
+                self.logger.info(f'Created table {dataset_id}.{table_id} (partitioned by modified_date, clustered by record_id)')
+
         return f'{self.project_id}.{dataset_id}.{table_id}'
-    
+
     def load_gcs_file_to_staging(self, gcs_uri: str, dataset_id: str, table_id: str) -> Dict[str, Any]:
         """Load GCS file to BigQuery staging table"""
         try:
@@ -79,7 +230,7 @@ class BQWriter:
             table_ref = self.bq_client.get_table(full_table_id)
             
             job_config = bigquery.LoadJobConfig(
-                write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+                write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
                 source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
                 max_bad_records=10  # Allow some bad records for debugging
             )

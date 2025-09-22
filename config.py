@@ -35,4 +35,3 @@ class AppConfig:
     BQ_CORE_DATASET: str = os.environ["BQ_CORE_DATASET"]
     BQ_CORE_TABLE: str = os.environ["BQ_CORE_TABLE"]
 
-    MERGE_KEYS: list[str] = tuple(k.strip() for k in os.getenv("MERGE_KEYS", "id").split(",") if k.strip())

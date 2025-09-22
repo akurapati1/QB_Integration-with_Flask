@@ -38,8 +38,9 @@ class QuickbaseClient:
         skip: int,
         *,
         flatten_values: bool = False,
-        select_all_fields: bool = True,
-        select: Optional[list] = None,
+        select_all_fields: bool = False,
+        select: Optional[list] = [1,2,3,7],
+        where: Optional[str] = None,
         timeout: int = 120,
     ) -> List[Dict]:
         """
@@ -50,12 +51,15 @@ class QuickbaseClient:
             "select": (["a"] if select_all_fields else (select or [])),
             "options": {"top": int(page_size), "skip": int(skip)},
         }
+        if where:
+            payload["where"] = where
 
         resp = self.session.post(self.QB_QUERY_URL, headers=self.headers, json=payload, timeout=timeout)
         resp.raise_for_status()
         js = resp.json()
         raw_rows = js.get("data", []) or []
 
+        print(raw_rows)
         
         if not flatten_values:
             return raw_rows
